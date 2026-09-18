@@ -39,7 +39,7 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
         # 空位色不能只靠「有任何 1 pixel 命中」。
         # 兩張實機畫面差距很大，因此改成比例門檻。
         # 0.001 = 0.1%
-        self.empty_ratio_threshold = 0.001
+        self.empty_ratio_threshold = 0.005
         self.max_synthesis_rounds = 20
 
         # 一旦「倉庫後仍滿」而真正進入 synthesis，
