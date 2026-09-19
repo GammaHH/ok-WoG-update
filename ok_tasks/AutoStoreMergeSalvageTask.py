@@ -1,3 +1,4 @@
+import os
 import time
 
 from ok import TriggerTask
@@ -42,11 +43,11 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
         self.empty_ratio_threshold = 0.005
         self.max_synthesis_rounds = 20
 
-        # 一旦「倉庫後仍滿」而真正進入 synthesis，
-        # 本次處理就鎖定在合成流程。
-        # 合成終止後，在 Backpack_full 消失前不再重新跑倉庫，
-        # 避免 倉庫 → 合成 → 退出 → 倉庫 的循環。
-        self.synthesis_cycle_latched = False
+        # Local smoke-test flag:
+        #   $env:WOG_FORCE_STORE = "1"
+        # Forces one store -> synthesis cycle per process, then disables itself.
+        self._force_store_consumed = False
+
 
     def get_max_synthesis_rounds(self):
         config = getattr(
@@ -72,6 +73,11 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
             1,
             rounds
         )
+
+    @property
+    def force_store_test(self):
+        value = os.environ.get("WOG_FORCE_STORE", "")
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     # =========================================================
     # Common
@@ -893,18 +899,9 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
                 )
 
                 self.exit_synthesis()
-
-                backpack_full = self.find_fullscreen(
-                    "Backpack_full",
-                    threshold=0.80
+                self.log_info(
+                    "自動合成本輪結束：等待下一次 Backpack_full 檢查"
                 )
-
-                if backpack_full:
-                    self.log_info(
-                        "⚠ 合成嘗試被終止，且背包仍滿，請手動處理",
-                        notify=True
-                    )
-
                 return False
 
             self.click(
@@ -996,9 +993,6 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
                 if not synthesis_on:
                     return False
 
-        # 一旦真正進入 synthesis，本次週期鎖定在合成流程。
-        self.synthesis_cycle_latched = True
-
         synthesis_dx, synthesis_dy = (
             self.get_anchor_offset(
                 synthesis_on,
@@ -1021,20 +1015,22 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
 
     def auto_store(self):
 
-        # Backpack_full 是唯一啟動條件；未出現時保持安靜
-        backpack_full = self.find_fullscreen(
-            "Backpack_full",
-            threshold=0.80
-        )
+        force_store = self.force_store_test and not self._force_store_consumed
+
+        if force_store:
+            self._force_store_consumed = True
+            backpack_full = True
+            self.log_info(
+                "WOG_FORCE_STORE=1：跳過第一次 Backpack_full，強制進入一次存倉測試"
+            )
+        else:
+            # 正常模式：Backpack_full 是唯一啟動條件。
+            backpack_full = self.find_fullscreen(
+                "Backpack_full",
+                threshold=0.80
+            )
 
         if not backpack_full:
-            # Backpack_full 消失，代表上一個「倉庫 → 合成」週期已真正結束。
-            self.synthesis_cycle_latched = False
-            return
-
-        # 已經跑過「倉庫後仍滿 → 合成」且 synthesis 已終止。
-        # Backpack_full 尚未消失前不要再回頭跑倉庫。
-        if self.synthesis_cycle_latched:
             return
 
         self.log_info(
@@ -1107,10 +1103,16 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
         # 倉庫儲存完成後，Backpack_full 仍然存在
         # -----------------------------------------------------
 
-        backpack_still_full = self.find_fullscreen(
-            "Backpack_full",
-            threshold=0.80
-        )
+        if force_store:
+            backpack_still_full = True
+            self.log_info(
+                "WOG_FORCE_STORE=1：跳過存倉後 Backpack_full，強制進入合成測試"
+            )
+        else:
+            backpack_still_full = self.find_fullscreen(
+                "Backpack_full",
+                threshold=0.80
+            )
 
         if not backpack_still_full:
             return
@@ -1120,6 +1122,10 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
         )
 
         self.auto_synthesis()
+        self.log_info(
+            "本輪倉庫／合成流程結束，等待下一次 Backpack_full 檢查"
+        )
+        return
 
     # =========================================================
     # Future

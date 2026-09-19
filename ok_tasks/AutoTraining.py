@@ -166,10 +166,10 @@ class AutoTraining(BaseWoGTask, TriggerTask):
         }
 
         # 點選訓練項目後，等右側資料更新
-        self.select_wait = 0.8
+        self.select_wait = 0.2
 
         # 每次滾動後等待 UI 穩定
-        self.scroll_wait = 1.5
+        self.scroll_wait = 0.5
 
         # train_type 使用拖曳滾動。
         # 遊戲的位移比例約為 1:1，因此不再使用固定百分比。
@@ -188,10 +188,10 @@ class AutoTraining(BaseWoGTask, TriggerTask):
         self.focus_before_scroll_wait = 0.25
 
         # 連續幾次滾動都沒有新 category，就視為到底
-        self.no_new_limit = 3
+        self.no_new_limit = 1
 
         # 防止異常無限捲動
-        self.max_scroll_rounds = 15
+        self.max_scroll_rounds = 10
 
         # OCR threshold
         self.ocr_threshold = 0.10
