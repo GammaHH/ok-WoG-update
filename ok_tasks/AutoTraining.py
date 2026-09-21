@@ -203,6 +203,12 @@ class AutoTraining(BaseWoGTask, TriggerTask):
         self.train_off_rgb = (237, 226, 198)
         self.train_state_tolerance = 2
 
+        # train_money「金額不足」文字色（使用者實測）
+        # 紅字本身不能直接代表沒錢，因為 prerequisite 文字也會是紅色。
+        # 只有「cost OCR 可解析成數字」+「train_money 內存在此紅色」才判定沒錢。
+        self.train_insufficient_rgb = (208, 69, 53)
+        self.train_insufficient_tolerance = 5
+
         # ON/OFF 色只要有抓到就可判斷。
         # train tab 的狀態色只佔框內小區域，不使用百分比門檻。
         self.train_state_min_ratio = 0.0
@@ -512,6 +518,37 @@ class AutoTraining(BaseWoGTask, TriggerTask):
             return "off", box
 
         return "unknown", box
+
+    def detect_numeric_cost_insufficient(
+        self,
+        cost_box,
+        cost
+    ):
+        """
+        判斷 train_money 是否為「數字金額 + 紅字」。
+
+        prerequisite 文字同樣可能是紅色，因此顏色不能單獨判斷。
+        只有 cost 已成功解析成數字時，RGB (208, 69, 53) ±5
+        才代表目前金錢不足。
+
+        回傳：
+            (is_insufficient, red_ratio)
+        """
+
+        if cost is None:
+            return False, 0.0
+
+        red_range = self.make_color_range(
+            self.train_insufficient_rgb,
+            self.train_insufficient_tolerance
+        )
+
+        red_ratio = self.calculate_color_percentage(
+            red_range,
+            cost_box
+        )
+
+        return red_ratio > 0, red_ratio
 
     # =========================================================
     # OCR helpers
@@ -1164,11 +1201,21 @@ class AutoTraining(BaseWoGTask, TriggerTask):
                 )
             )
             cost = None
+            insufficient_money = False
+            insufficient_red_ratio = 0.0
         else:
             cost = (
                 self.parse_compact_number(
                     cost_raw
                 )
+            )
+
+            (
+                insufficient_money,
+                insufficient_red_ratio
+            ) = self.detect_numeric_cost_insufficient(
+                cost_box,
+                cost
             )
 
         return {
@@ -1181,6 +1228,8 @@ class AutoTraining(BaseWoGTask, TriggerTask):
             "cost_raw": cost_raw,
             "requirement_category": requirement_category,
             "requirement_level": requirement_level,
+            "insufficient_money": insufficient_money,
+            "insufficient_red_ratio": insufficient_red_ratio,
         }
 
     # =========================================================
@@ -2446,6 +2495,25 @@ class AutoTraining(BaseWoGTask, TriggerTask):
             ):
                 return False
 
+            # UI 最終安全判斷：
+            # prerequisite 也會紅，所以只有「數字 cost + 紅色」才代表沒錢。
+            if detail.get(
+                "insufficient_money"
+            ):
+                self.set_requirement_wait_cost(
+                    root_target_category,
+                    category,
+                    required_level,
+                    live_cost
+                )
+
+                self.log_info(
+                    f"Train 金額不足：{category} "
+                    f"cost={live_cost:,}，"
+                    "train_money 為紅色；停止 PAY"
+                )
+                return False
+
             current, _cap, _raw = (
                 self.read_global_money()
             )
@@ -2484,6 +2552,24 @@ class AutoTraining(BaseWoGTask, TriggerTask):
             )
 
             if after_category != category:
+                return False
+
+            after_level = after_detail.get(
+                "level"
+            )
+
+            # PAY 後等級沒有增加 = 點擊未生效。
+            # 立即停止，避免同一按鈕無限重複點擊。
+            if (
+                after_level is None
+                or after_level <= live_level
+            ):
+                self.log_info(
+                    f"Train PAY 無進展：{category} "
+                    f"Lv.{live_level} -> "
+                    f"{'?' if after_level is None else f'Lv.{after_level}'}；"
+                    "停止本輪避免迴圈"
+                )
                 return False
 
             self.update_train_memory(
@@ -2713,6 +2799,19 @@ class AutoTraining(BaseWoGTask, TriggerTask):
             if live_cost <= 0:
                 return False
 
+            # UI 最終安全判斷：
+            # prerequisite 文字也可能是紅色，但 prerequisite 已在上方分支處理；
+            # 到這裡只有「可解析數字 cost + 紅色」才代表金額不足。
+            if detail.get(
+                "insufficient_money"
+            ):
+                self.log_info(
+                    f"Train 金額不足：{category} "
+                    f"cost={live_cost:,}，"
+                    "train_money 為紅色；不點 PAY"
+                )
+                return False
+
             current, _cap, _raw = (
                 self.read_global_money()
             )
@@ -2744,11 +2843,32 @@ class AutoTraining(BaseWoGTask, TriggerTask):
                 )
             )
 
-            if after_category == category:
-                self.update_train_memory(
-                    category,
-                    after_detail
+            if after_category != category:
+                return False
+
+            after_level = after_detail.get(
+                "level"
+            )
+
+            # 真正成功至少應該看到 LV 上升。
+            # 若 PAY 沒造成任何進展，不能回 True，否則 auto_buy_tick
+            # 會把同一項目當成「已購買」而持續下一輪。
+            if (
+                after_level is None
+                or after_level <= live_level
+            ):
+                self.log_info(
+                    f"Train PAY 無進展：{category} "
+                    f"Lv.{live_level} -> "
+                    f"{'?' if after_level is None else f'Lv.{after_level}'}；"
+                    "停止本輪避免迴圈"
                 )
+                return False
+
+            self.update_train_memory(
+                category,
+                after_detail
+            )
 
             self.read_global_money()
 

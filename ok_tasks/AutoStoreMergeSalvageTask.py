@@ -1007,6 +1007,34 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
 
 
     # =========================================================
+    # Backpack full refresh/check
+    # =========================================================
+
+    def check_backpack_full_after_resort(self):
+        """
+        每次判斷 Backpack_full 前，先按一次 resort_backpack，
+        讓背包排序/狀態刷新後再做滿背包判斷。
+        """
+
+        resort = self.find_fullscreen(
+            "resort_backpack",
+            threshold=0.80
+        )
+
+        if resort:
+            self.click(resort)
+            self.input_wait()
+        else:
+            self.log_info(
+                "檢查 Backpack_full 前找不到 resort_backpack，改為直接檢查"
+            )
+
+        return self.find_fullscreen(
+            "Backpack_full",
+            threshold=0.80
+        )
+
+    # =========================================================
     # Main
     # =========================================================
 
@@ -1024,11 +1052,8 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
                 "WOG_FORCE_STORE=1：跳過第一次 Backpack_full，強制進入一次存倉測試"
             )
         else:
-            # 正常模式：Backpack_full 是唯一啟動條件。
-            backpack_full = self.find_fullscreen(
-                "Backpack_full",
-                threshold=0.80
-            )
+            # 正常模式：每次檢查 Backpack_full 前先按 resort_backpack。
+            backpack_full = self.check_backpack_full_after_resort()
 
         if not backpack_full:
             return
@@ -1109,10 +1134,8 @@ class AutoStoreMergeSalvageTask(BaseWoGTask, TriggerTask):
                 "WOG_FORCE_STORE=1：跳過存倉後 Backpack_full，強制進入合成測試"
             )
         else:
-            backpack_still_full = self.find_fullscreen(
-                "Backpack_full",
-                threshold=0.80
-            )
+            # 存倉後重新檢查 Backpack_full 前，也先按 resort_backpack。
+            backpack_still_full = self.check_backpack_full_after_resort()
 
         if not backpack_still_full:
             return
