@@ -1,3 +1,4 @@
+import ctypes
 import time
 
 from ok import BaseTask
@@ -64,6 +65,150 @@ class BaseWoGTask(BaseTask):
         return merged
 
     # =========================================================
+    # Windows foreground control
+    # =========================================================
+
+    @staticmethod
+    def _window_native_hwnd(hwnd_window):
+        """盡量從 ok-script 的 hwnd_window 取得 Win32 HWND。"""
+        for name in ("top_hwnd", "hwnd", "real_hwnd", "handle"):
+            try:
+                value = getattr(hwnd_window, name, None)
+                if callable(value):
+                    value = value()
+                value = int(value or 0)
+                if value > 0:
+                    try:
+                        root = int(
+                            ctypes.windll.user32.GetAncestor(value, 2) or 0
+                        )
+                        if root > 0:
+                            return root
+                    except Exception:
+                        pass
+                    return value
+            except Exception:
+                continue
+        return 0
+
+    def _window_is_foreground(self, hwnd_window):
+        try:
+            if hwnd_window.is_foreground():
+                return True
+        except Exception:
+            pass
+
+        hwnd = self._window_native_hwnd(hwnd_window)
+        if hwnd <= 0:
+            return False
+
+        try:
+            return int(ctypes.windll.user32.GetForegroundWindow() or 0) == hwnd
+        except Exception:
+            return False
+
+    @staticmethod
+    def wog_modifier_state():
+        """Read current modifier state without changing any key state."""
+        user32 = ctypes.windll.user32
+        keys = {
+            "SHIFT": 0x10,
+            "CTRL": 0x11,
+            "ALT": 0x12,
+            "LWIN": 0x5B,
+            "RWIN": 0x5C,
+        }
+        return {
+            name: bool(int(user32.GetAsyncKeyState(vk)) & 0x8000)
+            for name, vk in keys.items()
+        }
+
+    def _force_window_foreground_win32(self, hwnd_window):
+        """Use a minimal ALT-assisted Win32 foreground fallback."""
+        hwnd = self._window_native_hwnd(hwnd_window)
+        if hwnd <= 0:
+            return False
+
+        try:
+            user32 = ctypes.windll.user32
+            if not user32.IsWindow(hwnd):
+                return False
+
+            SW_RESTORE = 9
+            VK_MENU = 0x12
+            KEYEVENTF_KEYUP = 0x0002
+
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+
+            modifiers_before = self.wog_modifier_state()
+            if not modifiers_before["ALT"]:
+                user32.keybd_event(VK_MENU, 0, 0, 0)
+                try:
+                    time.sleep(0.03)
+                finally:
+                    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+                    time.sleep(0.03)
+
+                if self.wog_modifier_state()["ALT"]:
+                    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.SetForegroundWindow(hwnd)
+            return int(user32.GetForegroundWindow() or 0) == hwnd
+        except Exception as exc:
+            self.log_debug(
+                f"WoG Win32 foreground fallback 失敗: {exc}"
+            )
+            return False
+
+    def wog_ensure_foreground(self):
+        """
+        顯式把 WoG 遊戲視窗拉到真正 foreground。
+
+        AutoTraining 的 Pynput / wheel mapping 依賴真實前景輸入；
+        因此不能只接受工作列閃爍。最多兩輪，最後重新驗證。
+        """
+        interaction = getattr(self.executor, "interaction", None)
+        hwnd_window = getattr(interaction, "hwnd_window", None)
+        if hwnd_window is None:
+            device_manager = getattr(self.executor, "device_manager", None)
+            hwnd_window = getattr(device_manager, "hwnd_window", None)
+
+        if hwnd_window is None:
+            return False
+
+        if self._window_is_foreground(hwnd_window):
+            return True
+
+        for attempt in range(1, 3):
+            result = None
+            try:
+                result = hwnd_window.bring_to_front()
+            except Exception as exc:
+                self.log_debug(
+                    f"WoG bring_to_front 第 {attempt} 次失敗: {exc}"
+                )
+
+            time.sleep(0.15)
+
+            if self._window_is_foreground(hwnd_window):
+                return True
+
+            self._force_window_foreground_win32(hwnd_window)
+            time.sleep(0.20)
+
+            if self._window_is_foreground(hwnd_window):
+                return True
+
+            self.log_info(
+                "WoG：前景取得未成功 "
+                f"(attempt={attempt}/2, bring_to_front={result})"
+            )
+
+        return False
+
+    # =========================================================
     # Windows cursor recovery
     # =========================================================
 
@@ -95,30 +240,14 @@ class BaseWoGTask(BaseTask):
         """
 
         try:
-            interaction = getattr(
-                self.executor,
-                "interaction",
-                None
-            )
-
-            hwnd_window = getattr(
-                interaction,
-                "hwnd_window",
-                None
-            )
-
-            if hwnd_window:
-                hwnd_window.bring_to_front()
-
+            self.wog_ensure_foreground()
         except Exception as exc:
             self.log_debug(
-                f"SetCursorPos recovery bring_to_front 失敗: {exc}"
+                f"SetCursorPos recovery foreground 失敗: {exc}"
             )
 
         # 使用父類 sleep，避免任何子類自訂 sleep 造成遞迴。
-        super().sleep(
-            0.30
-        )
+        time.sleep(0.30)
 
     def _run_cursor_operation_with_retry(
         self,
@@ -223,6 +352,18 @@ class BaseWoGTask(BaseTask):
 
         不會因為處理 offline 就取消本輪原 task。
         """
+
+        if not getattr(self, "_wog_startup_foreground_done", False):
+            try:
+                self.wog_ensure_foreground()
+            except Exception as exc:
+                self.log_debug(
+                    f"WoG startup foreground 失敗，繼續 Task: {exc}"
+                )
+            finally:
+                self._wog_startup_foreground_done = True
+
+            time.sleep(0.15)
 
         handled = self.check_offline_common()
 
