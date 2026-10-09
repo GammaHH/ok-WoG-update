@@ -2,7 +2,7 @@ import os
 import time
 
 from ok import TriggerTask
-from src.task.BaseWoGTask import BaseWoGTask
+from src.tasks.BaseWoGTask import BaseWoGTask
 from ok.feature.Box import Box
 
 

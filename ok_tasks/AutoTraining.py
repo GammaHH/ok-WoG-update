@@ -2,7 +2,7 @@ import re
 import time
 
 from ok import TriggerTask
-from src.task.BaseWoGTask import BaseWoGTask
+from src.tasks.BaseWoGTask import BaseWoGTask
 from ok.feature.Box import Box
 
 
@@ -1626,23 +1626,25 @@ class AutoTraining(BaseWoGTask, TriggerTask):
         return new_count, stop_after_page
 
     def force_game_focus(self):
-        interaction = self.executor.interaction
+        """
+        滾輪輸入前使用完整 ForeGuard，而不是只盲呼叫 bring_to_front。
 
-        hwnd_window = getattr(
-            interaction,
-            "hwnd_window",
-            None
-        )
+        成功條件是 Win32 實際前景視窗確實為 WoG；同時清理可能殘留的
+        Shift/Ctrl/Alt key-up。失敗時不得把滾輪送到其他視窗。
+        """
+        if not self.wog_prepare_foreground_input():
+            self.log_info(
+                "AutoTraining ForeGuard 未確認 WoG 前景，略過本次滾動"
+            )
+            return False
 
-        if hwnd_window is not None:
-            try:
-                hwnd_window.bring_to_front()
-            except Exception:
-                pass
-
-        self.sleep(
-            self.focus_before_scroll_wait
-        )
+        # 使用 raw sleep，避免 capture / visible gate 在前景恢復時阻塞。
+        try:
+            wait = max(0.0, float(self.focus_before_scroll_wait))
+        except (TypeError, ValueError):
+            wait = 0.0
+        time.sleep(wait)
+        return True
 
     def scroll_train_type(
         self,
@@ -1650,8 +1652,7 @@ class AutoTraining(BaseWoGTask, TriggerTask):
         scroll_round=None
     ):
         """
-        舊版實機可用的 wheel scroll。
-        每次 scroll 前只多做 force focus。
+        舊版實機可用的 wheel scroll，輸入前先通過完整 ForeGuard。
         """
 
         x = int(
@@ -1664,7 +1665,8 @@ class AutoTraining(BaseWoGTask, TriggerTask):
             + train_type_box.height * 0.5
         )
 
-        self.force_game_focus()
+        if not self.force_game_focus():
+            return False
 
         self.scroll(
             x,
@@ -1675,6 +1677,8 @@ class AutoTraining(BaseWoGTask, TriggerTask):
         self.sleep(
             self.scroll_wait
         )
+
+        return True
 
     def reset_train_view(self):
         """
@@ -1828,10 +1832,11 @@ class AutoTraining(BaseWoGTask, TriggerTask):
             ):
                 break
 
-            self.scroll_train_type(
+            if not self.scroll_train_type(
                 train_type_box,
                 scroll_round
-            )
+            ):
+                return False
             self.current_train_scroll_round = scroll_round
 
             new_count, stop_after_page = (
@@ -2000,10 +2005,11 @@ class AutoTraining(BaseWoGTask, TriggerTask):
                     + 1
                 )
 
-                self.scroll_train_type(
+                if not self.scroll_train_type(
                     boxes["type"],
                     next_round
-                )
+                ):
+                    return None, None
 
                 self.current_train_scroll_round = (
                     next_round

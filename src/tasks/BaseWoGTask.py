@@ -69,6 +69,24 @@ class BaseWoGTask(BaseTask):
     # =========================================================
 
     @staticmethod
+    def _get_wog_foreground_window_from(executor):
+        """
+        Foreground 判斷優先使用 device manager 的遊戲視窗。
+
+        GenshinInteraction 的 hwnd_window 可能是輸入用包裝；TBH 實機驗證後
+        採用 device manager 優先，WoG 同步使用相同選擇順序。
+        """
+        device_manager = getattr(executor, "device_manager", None)
+        hwnd_window = getattr(device_manager, "hwnd_window", None)
+        if hwnd_window is None:
+            interaction = getattr(executor, "interaction", None)
+            hwnd_window = getattr(interaction, "hwnd_window", None)
+        return hwnd_window
+
+    def _get_wog_foreground_window(self):
+        return self._get_wog_foreground_window_from(self.executor)
+
+    @staticmethod
     def _window_native_hwnd(hwnd_window):
         """盡量從 ok-script 的 hwnd_window 取得 Win32 HWND。"""
         for name in ("top_hwnd", "hwnd", "real_hwnd", "handle"):
@@ -109,7 +127,7 @@ class BaseWoGTask(BaseTask):
 
     @staticmethod
     def wog_modifier_state():
-        """Read current modifier state without changing any key state."""
+        """讀取全域 modifier 狀態；讀取失敗時視為未按下。"""
         user32 = ctypes.windll.user32
         keys = {
             "SHIFT": 0x10,
@@ -118,17 +136,66 @@ class BaseWoGTask(BaseTask):
             "LWIN": 0x5B,
             "RWIN": 0x5C,
         }
-        return {
-            name: bool(int(user32.GetAsyncKeyState(vk)) & 0x8000)
-            for name, vk in keys.items()
-        }
+        states = {}
+        for name, vk in keys.items():
+            try:
+                states[name] = bool(
+                    int(user32.GetAsyncKeyState(vk)) & 0x8000
+                )
+            except Exception:
+                states[name] = False
+        return states
+
+    def _release_wog_modifiers(self, reason="foreground guard", user32=None):
+        """
+        對 Windows 與目前前景遊戲補送 modifier key-up。
+
+        同時釋放 generic / left / right VK，處理曾經遺失 key-up 後，
+        必須人工按 Shift / Ctrl / Alt 才能恢復的狀態。
+        本函式只在 ForeGuard 邊界呼叫，不介入一般文字輸入。
+        """
+        if user32 is None:
+            user32 = ctypes.windll.user32
+
+        KEYEVENTF_KEYUP = 0x0002
+        modifier_keys = (
+            ("SHIFT", 0x10),
+            ("LSHIFT", 0xA0),
+            ("RSHIFT", 0xA1),
+            ("CTRL", 0x11),
+            ("LCTRL", 0xA2),
+            ("RCTRL", 0xA3),
+            ("ALT", 0x12),
+            ("LALT", 0xA4),
+            ("RALT", 0xA5),
+        )
+
+        released = []
+        for name, vk in modifier_keys:
+            try:
+                user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+                released.append(name)
+            except Exception as exc:
+                self.log_debug(
+                    f"WoG ForeGuard 釋放 {name} 失敗 ({reason}): {exc}"
+                )
+
+        time.sleep(0.01)
+        return released
 
     def _force_window_foreground_win32(self, hwnd_window):
-        """Use a minimal ALT-assisted Win32 foreground fallback."""
+        """
+        ALT-assisted Win32 foreground fallback。
+
+        不論 fallback 成功或發生例外，finally 都會補送 Shift/Ctrl/Alt
+        key-up，避免合成 ALT tap 中斷後污染後續鍵盤狀態。
+        """
         hwnd = self._window_native_hwnd(hwnd_window)
         if hwnd <= 0:
             return False
 
+        user32 = None
+        alt_pressed = False
         try:
             user32 = ctypes.windll.user32
             if not user32.IsWindow(hwnd):
@@ -141,17 +208,18 @@ class BaseWoGTask(BaseTask):
             if user32.IsIconic(hwnd):
                 user32.ShowWindow(hwnd, SW_RESTORE)
 
-            modifiers_before = self.wog_modifier_state()
-            if not modifiers_before["ALT"]:
-                user32.keybd_event(VK_MENU, 0, 0, 0)
-                try:
-                    time.sleep(0.03)
-                finally:
-                    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-                    time.sleep(0.03)
+            # 若前一次操作遺失 key-up，先清掉殘留狀態再製造乾淨的 ALT tap。
+            self._release_wog_modifiers(
+                reason="before ALT foreground fallback",
+                user32=user32
+            )
 
-                if self.wog_modifier_state()["ALT"]:
-                    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_MENU, 0, 0, 0)
+            alt_pressed = True
+            time.sleep(0.03)
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            alt_pressed = False
+            time.sleep(0.03)
 
             user32.ShowWindow(hwnd, SW_RESTORE)
             user32.SetForegroundWindow(hwnd)
@@ -162,23 +230,40 @@ class BaseWoGTask(BaseTask):
             )
             return False
 
-    def wog_ensure_foreground(self):
-        """
-        顯式把 WoG 遊戲視窗拉到真正 foreground。
+        finally:
+            if user32 is not None:
+                if alt_pressed:
+                    try:
+                        user32.keybd_event(
+                            VK_MENU,
+                            0,
+                            KEYEVENTF_KEYUP,
+                            0
+                        )
+                    except Exception:
+                        pass
 
-        AutoTraining 的 Pynput / wheel mapping 依賴真實前景輸入；
-        因此不能只接受工作列閃爍。最多兩輪，最後重新驗證。
-        """
-        interaction = getattr(self.executor, "interaction", None)
-        hwnd_window = getattr(interaction, "hwnd_window", None)
-        if hwnd_window is None:
-            device_manager = getattr(self.executor, "device_manager", None)
-            hwnd_window = getattr(device_manager, "hwnd_window", None)
+                self._release_wog_modifiers(
+                    reason="after ALT foreground fallback",
+                    user32=user32
+                )
 
+    def _ensure_wog_window_foreground(
+        self,
+        hwnd_window,
+        reset_modifiers=False
+    ):
+        """
+        使用 TBH ForeGuard 的完整檢測順序：
+        已在前景 → bring_to_front → Win32 ALT fallback → 再驗證。
+        """
         if hwnd_window is None:
+            self.log_debug("WoG ForeGuard：目前沒有 hwnd_window")
             return False
 
         if self._window_is_foreground(hwnd_window):
+            if reset_modifiers:
+                self._release_wog_modifiers(reason="already foreground")
             return True
 
         for attempt in range(1, 3):
@@ -190,23 +275,48 @@ class BaseWoGTask(BaseTask):
                     f"WoG bring_to_front 第 {attempt} 次失敗: {exc}"
                 )
 
+            # ForeGuard 不走 TaskExecutor.sleep，避免 capture gate 阻塞。
             time.sleep(0.15)
 
             if self._window_is_foreground(hwnd_window):
+                if reset_modifiers:
+                    self._release_wog_modifiers(reason="bring_to_front")
                 return True
 
             self._force_window_foreground_win32(hwnd_window)
             time.sleep(0.20)
 
             if self._window_is_foreground(hwnd_window):
+                if reset_modifiers:
+                    self._release_wog_modifiers(reason="Win32 fallback")
                 return True
 
             self.log_info(
-                "WoG：前景取得未成功 "
+                "WoG ForeGuard：前景取得未成功 "
                 f"(attempt={attempt}/2, bring_to_front={result})"
             )
 
         return False
+
+    def wog_ensure_foreground(self, reset_modifiers=False):
+        """
+        顯式把 WoG 遊戲視窗拉到真正 foreground。
+
+        AutoTraining 的 Pynput / wheel mapping 依賴真實前景輸入；
+        因此不能只接受工作列閃爍。最多兩輪，最後重新驗證。
+        """
+        try:
+            return self._ensure_wog_window_foreground(
+                self._get_wog_foreground_window(),
+                reset_modifiers=reset_modifiers
+            )
+        except Exception as exc:
+            self.log_debug(f"WoG ForeGuard 暫時失敗，繼續排程: {exc}")
+            return False
+
+    def wog_prepare_foreground_input(self):
+        """供 AutoTraining 在真實滑鼠/滾輪輸入前使用。"""
+        return self.wog_ensure_foreground(reset_modifiers=True)
 
     # =========================================================
     # Windows cursor recovery
@@ -240,7 +350,7 @@ class BaseWoGTask(BaseTask):
         """
 
         try:
-            self.wog_ensure_foreground()
+            self.wog_ensure_foreground(reset_modifiers=True)
         except Exception as exc:
             self.log_debug(
                 f"SetCursorPos recovery foreground 失敗: {exc}"
@@ -309,8 +419,12 @@ class BaseWoGTask(BaseTask):
         **kwargs
     ):
         """
-        所有 WoG TriggerTask 共用的 click SetCursorPos recovery。
+        所有 WoG TriggerTask 共用的 ForeGuard + SetCursorPos recovery。
         """
+
+        if not self.wog_ensure_foreground():
+            self.log_info("WoG ForeGuard 未確認前景，略過本次 click")
+            return False
 
         return self._run_cursor_operation_with_retry(
             "click",
@@ -325,11 +439,15 @@ class BaseWoGTask(BaseTask):
         **kwargs
     ):
         """
-        所有 WoG TriggerTask 共用的 scroll SetCursorPos recovery。
+        所有 WoG TriggerTask 共用的 ForeGuard + SetCursorPos recovery。
 
         AutoTraining 的滾輪操作最容易碰到 Windows
         SetCursorPos 瞬間失敗，因此在這層統一重試。
         """
+
+        if not self.wog_ensure_foreground():
+            self.log_info("WoG ForeGuard 未確認前景，略過本次 scroll")
+            return False
 
         return self._run_cursor_operation_with_retry(
             "scroll",
@@ -355,7 +473,7 @@ class BaseWoGTask(BaseTask):
 
         if not getattr(self, "_wog_startup_foreground_done", False):
             try:
-                self.wog_ensure_foreground()
+                self.wog_ensure_foreground(reset_modifiers=True)
             except Exception as exc:
                 self.log_debug(
                     f"WoG startup foreground 失敗，繼續 Task: {exc}"

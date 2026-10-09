@@ -5,7 +5,7 @@ from ok import TriggerTask
 from ok.feature.Box import Box
 from ok.util.color import find_color_rectangles
 
-from src.task.BaseWoGTask import BaseWoGTask
+from src.tasks.BaseWoGTask import BaseWoGTask
 from ok_tasks.AutoTraining import AutoTraining
 
 
